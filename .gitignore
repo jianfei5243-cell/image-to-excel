@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# 输出与临时文件
+*.xlsx
+output/
+:memory:.ses
+*.log
+
+# 隐私：用户的真实截图示例不上传到公开仓库
+examples/
+
+# Streamlit 密钥（如有）
+.streamlit/secrets.toml
