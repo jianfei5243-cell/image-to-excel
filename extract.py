@@ -17,6 +17,21 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 import pandas as pd
+
+# rapid_table 3.0.2 在导入时会在包目录（site-packages，只读）下创建 models 目录，
+# 在 Streamlit Cloud 等只读环境会抛 PermissionError。这里先把 Path.mkdir 变为容错操作。
+_original_path_mkdir = Path.mkdir
+
+
+def _safe_path_mkdir(self, mode=0o777, parents=False, exist_ok=False):
+    try:
+        return _original_path_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+    except PermissionError:
+        return None
+
+
+Path.mkdir = _safe_path_mkdir
+
 from rapidocr import RapidOCR
 from rapid_table import ModelType, RapidTable, RapidTableInput
 
@@ -35,18 +50,37 @@ for _name in ("rapidocr", "RapidOCR", "rapid_table", "RapidTable"):
 MIN_CONFIDENCE = 30
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
+# 仓库内自带的本地模型目录（避免运行时联网下载 / 写入只读目录）
+MODELS_DIR = Path(__file__).resolve().parent / "models"
+
 # 进度回调签名：(当前序号, 总数, 文件名)
 ProgressCallback = Callable[[int, int, str], None]
 
 
 def build_ocr() -> RapidOCR:
-    """创建简体中文 OCR 实例。"""
-    return RapidOCR(params={"Rec.lang_type": _LANG_TYPE})
+    """创建简体中文 OCR 实例（使用仓库内自带的本地模型）。"""
+    return RapidOCR(
+        params={
+            "Global.model_root_dir": str(MODELS_DIR / "rapidocr"),
+            "Rec.lang_type": _LANG_TYPE,
+        }
+    )
 
 
 def build_table_engine() -> RapidTable:
-    """创建表格结构识别引擎（SLANet-Plus，中文表格精度高）。"""
-    return RapidTable(RapidTableInput(model_type=ModelType.SLANETPLUS))
+    """创建表格结构识别引擎（使用仓库内自带的 SLANet-Plus 本地模型）。"""
+    return RapidTable(
+        RapidTableInput(
+            model_type=ModelType.SLANETPLUS,
+            model_dir_or_path=str(MODELS_DIR / "rapid_table" / "slanet-plus.onnx"),
+            # RapidTable 内部会再创建一个 OCR 引擎（即使我们外部已传入 OCR 结果），
+            # 这里也把它指向本地模型，避免在只读环境尝试联网下载。
+            ocr_params={
+                "Global.model_root_dir": str(MODELS_DIR / "rapidocr"),
+                "Rec.lang_type": _LANG_TYPE,
+            },
+        )
+    )
 
 
 def _filter_ocr(result, min_confidence: int):
