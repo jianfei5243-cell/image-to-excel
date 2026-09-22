@@ -9,9 +9,11 @@
 from __future__ import annotations
 
 import argparse
+import cv2
 import html
 import io
 import logging
+import numpy as np
 import re
 import sys
 from dataclasses import dataclass, field
@@ -144,7 +146,7 @@ class TableGrid:
                         attrs.append(f'rowspan="{cell.rowspan}"')
                     if cell.colspan > 1:
                         attrs.append(f'colspan="{cell.colspan}"')
-                    text = html.escape(cell.text) if cell.text else "&nbsp;"
+                    text = html.escape(cell.text).replace("\n", "<br>") if cell.text else "&nbsp;"
                     attr_str = f" {' '.join(attrs)}" if attrs else ""
                     tds.append(f"<td{attr_str}>{text}</td>")
                 elif (r, c) in occupied:
@@ -201,6 +203,168 @@ def _parse_table_html(html: str, logic_points) -> TableGrid:
     return TableGrid(n_rows, n_cols, cells)
 
 
+def _load_image_array(path: str | Path) -> np.ndarray | None:
+    """读取图片为 BGR 数组（兼容非 ASCII 路径）。"""
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+        if data.size == 0:
+            return None
+        return cv2.imdecode(data, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+
+
+def _clusters(indices: np.ndarray, gap: int) -> list[int]:
+    """把离散像素坐标聚类为线段位置。"""
+    groups: list[list[int]] = []
+    for x in indices:
+        if groups and x - groups[-1][-1] <= gap:
+            groups[-1].append(int(x))
+        else:
+            groups.append([int(x)])
+    return [int(sum(g) / len(g)) for g in groups]
+
+
+def _detect_grid_lines(img: np.ndarray) -> tuple[list[int], list[int], np.ndarray, np.ndarray, int, int]:
+    """检测表格的列/行边界线，返回 (col_edges, row_edges, vline_mask, hline_mask, h, w)。"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    h, w = gray.shape[:2]
+    bw = cv2.adaptiveThreshold(
+        255 - gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 8
+    )
+
+    # 长竖线 → 列边界
+    vkernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(40, h // 10)))
+    vline = cv2.morphologyEx(bw, cv2.MORPH_OPEN, vkernel)
+    # 短竖线/横线，用于判断某个单元格是否被合并（局部是否存在分隔线）
+    vline_any = cv2.morphologyEx(
+        bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
+    )
+    hkernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(40, w // 6), 1))
+    hline = cv2.morphologyEx(bw, cv2.MORPH_OPEN, hkernel)
+    hline_any = cv2.morphologyEx(
+        bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
+    )
+
+    col_edges = _clusters(np.where(vline.sum(axis=0) > h * 0.15)[0], 10)
+    row_edges = _clusters(np.where(hline.sum(axis=1) > w * 0.5)[0], 8)
+    return col_edges, row_edges, vline_any, hline_any, h, w
+
+
+def _join_cell_texts(texts: list[tuple[float, float, str]]) -> str:
+    """把同一单元格内的多条 OCR 文本按行拼接，行内用空格、换行用换行符。"""
+    if not texts:
+        return ""
+    texts.sort()
+    lines: list[list[str]] = []
+    current: list[str] = []
+    current_y: float | None = None
+    for cy, _cx, txt in texts:
+        if current_y is None or abs(cy - current_y) <= 8:
+            current.append(txt)
+            if current_y is None:
+                current_y = cy
+        else:
+            lines.append(current)
+            current = [txt]
+            current_y = cy
+    if current:
+        lines.append(current)
+    return "\n".join(" ".join(line) for line in lines)
+
+
+def _rebuild_grid(
+    col_edges: list[int],
+    row_edges: list[int],
+    vline_any: np.ndarray,
+    hline_any: np.ndarray,
+    boxes: Sequence,
+    txts: Sequence[str],
+    h: int,
+    w: int,
+) -> TableGrid:
+    """按表格线把 OCR 文本归位到网格，并还原 rowspan / colspan 合并。"""
+    ncols = len(col_edges) - 1
+    nrows = len(row_edges) - 1
+    covered = [[False] * ncols for _ in range(nrows)]
+
+    centers: list[tuple[float, float]] = []
+    for box in boxes:
+        centers.append(
+            ((box[:, 0].min() + box[:, 0].max()) / 2, (box[:, 1].min() + box[:, 1].max()) / 2)
+        )
+
+    cells: list[CellRef] = []
+    for r in range(nrows):
+        for c in range(ncols):
+            if covered[r][c]:
+                continue
+
+            rowspan = 1
+            while r + rowspan < nrows:
+                y = row_edges[r + rowspan]
+                x0, x1 = int(col_edges[c]) + 3, int(col_edges[c + 1]) - 3
+                if x1 <= x0 or hline_any[max(0, y - 3): min(h, y + 4), x0:x1].any():
+                    break
+                rowspan += 1
+
+            colspan = 1
+            while c + colspan < ncols:
+                x = col_edges[c + colspan]
+                y0, y1 = int(row_edges[r]) + 3, int(row_edges[r + rowspan]) - 3
+                if y1 <= y0 or vline_any[y0:y1, max(0, int(x) - 3): min(w, int(x) + 4)].any():
+                    break
+                colspan += 1
+
+            x0, y0 = col_edges[c], row_edges[r]
+            x1, y1 = col_edges[c + colspan], row_edges[r + rowspan]
+            texts: list[tuple[float, float, str]] = []
+            for (cx, cy), txt in zip(centers, txts):
+                if x0 <= cx <= x1 and y0 <= cy <= y1:
+                    texts.append((cy, cx, txt))
+            cells.append(CellRef(r, c, rowspan, colspan, _join_cell_texts(texts)))
+
+            for rr in range(r, r + rowspan):
+                for cc in range(c, c + colspan):
+                    covered[rr][cc] = True
+
+    return TableGrid(nrows, ncols, cells)
+
+
+def _try_grid_reconstruction(
+    img: np.ndarray,
+    ocr_result,
+    min_confidence: int,
+) -> TableGrid | None:
+    """优先用表格线重建（针对长图效果好）；失败返回 None 以回退到模型。"""
+    boxes = getattr(ocr_result, "boxes", None)
+    txts = getattr(ocr_result, "txts", None)
+    scores = getattr(ocr_result, "scores", None)
+    if boxes is None or txts is None:
+        return None
+
+    try:
+        col_edges, row_edges, vline_any, hline_any, h, w = _detect_grid_lines(img)
+    except Exception:
+        return None
+
+    if len(col_edges) < 3 or len(row_edges) < 4:  # 至少 2 列、3 行
+        return None
+
+    keep = [i for i, s in enumerate(scores) if float(s) * 100 >= min_confidence]
+    if not keep:
+        keep = list(range(len(txts)))
+    filtered_boxes = [boxes[i] for i in keep]
+    filtered_txts = [txts[i] for i in keep]
+
+    grid = _rebuild_grid(
+        col_edges, row_edges, vline_any, hline_any, filtered_boxes, filtered_txts, h, w
+    )
+    if grid.n_rows < 2 or grid.n_cols < 2:
+        return None
+    return grid
+
+
 def extract_tables_from_image(
     image_path: str | Path,
     ocr: RapidOCR,
@@ -208,7 +372,16 @@ def extract_tables_from_image(
     min_confidence: int = MIN_CONFIDENCE,
 ) -> list[TableGrid]:
     """识别单张图片中的表格，返回还原后的 TableGrid 列表。"""
-    boxes, txts, scores = _filter_ocr(ocr(str(image_path)), min_confidence)
+    ocr_result = ocr(str(image_path))
+
+    # 竖长图（高 > 宽）会被结构模型压扁、导致列错位，优先用表格线重建。
+    img = _load_image_array(image_path)
+    if img is not None and img.shape[0] > img.shape[1]:
+        grid = _try_grid_reconstruction(img, ocr_result, min_confidence)
+        if grid is not None:
+            return [grid]
+
+    boxes, txts, scores = _filter_ocr(ocr_result, min_confidence)
     results = table_engine(str(image_path), ocr_results=[(boxes, txts, scores)])
     html_list = getattr(results, "pred_htmls", None) or []
     logic_points = getattr(results, "logic_points", None) or []
