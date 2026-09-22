@@ -9,11 +9,12 @@
 from __future__ import annotations
 
 import argparse
+import html
 import io
 import logging
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -122,6 +123,42 @@ class TableGrid:
         for cell in self.cells:
             grid[cell.row][cell.col] = cell.text
         return pd.DataFrame(grid)
+
+    def to_html(self) -> str:
+        """转成带边框和合并单元格的 HTML 表格，用于网页预览。"""
+        td_map = {(cell.row, cell.col): cell for cell in self.cells}
+        occupied: set[tuple[int, int]] = set()
+        for cell in self.cells:
+            for r in range(cell.row, cell.row + cell.rowspan):
+                for c in range(cell.col, cell.col + cell.colspan):
+                    occupied.add((r, c))
+
+        rows_html: list[str] = []
+        for r in range(self.n_rows):
+            tds: list[str] = []
+            for c in range(self.n_cols):
+                cell = td_map.get((r, c))
+                if cell is not None:
+                    attrs: list[str] = []
+                    if cell.rowspan > 1:
+                        attrs.append(f'rowspan="{cell.rowspan}"')
+                    if cell.colspan > 1:
+                        attrs.append(f'colspan="{cell.colspan}"')
+                    text = html.escape(cell.text) if cell.text else "&nbsp;"
+                    attr_str = f" {' '.join(attrs)}" if attrs else ""
+                    tds.append(f"<td{attr_str}>{text}</td>")
+                elif (r, c) in occupied:
+                    continue  # 已被上方/左侧的合并单元格覆盖
+                else:
+                    tds.append("<td>&nbsp;</td>")
+            rows_html.append("<tr>" + "".join(tds) + "</tr>")
+
+        return (
+            '<table border="1" cellspacing="0" cellpadding="0" '
+            'style="border-collapse:collapse;font-size:13px;table-layout:auto;">'
+            + "".join(rows_html)
+            + "</table>"
+        )
 
 def _parse_table_html(html: str, logic_points) -> TableGrid:
     """把 rapid_table 输出的 HTML 与逻辑坐标还原成带合并信息的表格结构。
@@ -278,50 +315,71 @@ def table_to_excel_bytes(grid: TableGrid, first_row_header: bool = False) -> byt
     return buffer.read()
 
 
-def images_to_excel_bytes(
+@dataclass
+class ImageResult:
+    """一张图片的识别结果：还原出的表格列表，或失败原因。"""
+
+    path: Path
+    grids: list[TableGrid] = field(default_factory=list)
+    error: str | None = None
+
+
+def images_to_grids(
     image_paths: Sequence[str | Path],
     min_confidence: int = MIN_CONFIDENCE,
     ocr: RapidOCR | None = None,
     table_engine: RapidTable | None = None,
     progress: ProgressCallback | None = None,
+) -> list[ImageResult]:
+    """识别多张图片，返回每张图片还原出的表格结构（供预览与导出复用）。"""
+    ocr = ocr or build_ocr()
+    table_engine = table_engine or build_table_engine()
+    results: list[ImageResult] = []
+    for index, path in enumerate(image_paths):
+        path = Path(path)
+        if progress:
+            progress(index, len(image_paths), path.name)
+        try:
+            grids = extract_tables_from_image(
+                path, ocr=ocr, table_engine=table_engine, min_confidence=min_confidence
+            )
+        except Exception as exc:  # 单张失败不影响其它图片
+            results.append(ImageResult(path=path, error=str(exc)))
+            continue
+        results.append(ImageResult(path=path, grids=grids))
+    return results
+
+
+def grids_to_excel_bytes(
+    results: Sequence[ImageResult],
     first_row_header: bool = False,
 ) -> bytes:
-    """把多张图片里的表格汇总到一个 Excel 文件（返回 bytes）。
+    """把识别结果写进一个 Excel 文件（返回 bytes）。
 
     每张识别出的表格一个工作表（命名「图片名_序号」），另有一个「汇总」工作表。
     """
-    ocr = ocr or build_ocr()
-    table_engine = table_engine or build_table_engine()
     buffer = io.BytesIO()
     used_names: set[str] = {"汇总"}
     manifest: list[dict] = []
 
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
         workbook = writer.book
-        for index, path in enumerate(image_paths):
-            path = Path(path)
-            if progress:
-                progress(index, len(image_paths), path.name)
-
-            try:
-                grids = extract_tables_from_image(
-                    path, ocr=ocr, table_engine=table_engine, min_confidence=min_confidence
-                )
-            except Exception as exc:  # 单张失败不影响其它图片
-                manifest.append({"文件": path.name, "状态": f"识别失败：{exc}"})
+        for result in results:
+            if result.error:
+                manifest.append({"文件": result.path.name, "状态": f"识别失败：{result.error}"})
                 continue
 
-            if not grids:
-                manifest.append({"文件": path.name, "状态": "未检测到表格"})
+            if not result.grids:
+                manifest.append({"文件": result.path.name, "状态": "未检测到表格"})
                 continue
 
-            for table_index, grid in enumerate(grids, start=1):
-                sheet = _sanitize_sheet_name(f"{path.stem}_{table_index}", used_names)
+            for table_index, grid in enumerate(result.grids, start=1):
+                sheet = _sanitize_sheet_name(f"{result.path.stem}_{table_index}", used_names)
                 worksheet = workbook.add_worksheet(sheet)
                 _write_grid_to_sheet(workbook, worksheet, grid, first_row_header)
                 manifest.append(
                     {
-                        "文件": path.name,
+                        "文件": result.path.name,
                         "工作表": sheet,
                         "状态": "成功",
                         "行数": grid.n_rows,
@@ -333,6 +391,25 @@ def images_to_excel_bytes(
 
     buffer.seek(0)
     return buffer.read()
+
+
+def images_to_excel_bytes(
+    image_paths: Sequence[str | Path],
+    min_confidence: int = MIN_CONFIDENCE,
+    ocr: RapidOCR | None = None,
+    table_engine: RapidTable | None = None,
+    progress: ProgressCallback | None = None,
+    first_row_header: bool = False,
+) -> bytes:
+    """把多张图片里的表格汇总到一个 Excel 文件（返回 bytes）。"""
+    results = images_to_grids(
+        image_paths,
+        min_confidence=min_confidence,
+        ocr=ocr,
+        table_engine=table_engine,
+        progress=progress,
+    )
+    return grids_to_excel_bytes(results, first_row_header=first_row_header)
 
 
 def _collect_images(inputs: Sequence[str]) -> list[Path]:

@@ -9,7 +9,14 @@ from pathlib import Path
 
 import streamlit as st
 
-from extract import MIN_CONFIDENCE, SUPPORTED_EXTS, build_ocr, build_table_engine, images_to_excel_bytes
+from extract import (
+    MIN_CONFIDENCE,
+    SUPPORTED_EXTS,
+    build_ocr,
+    build_table_engine,
+    grids_to_excel_bytes,
+    images_to_grids,
+)
 
 st.set_page_config(page_title="图片表格 → Excel", page_icon="📷", layout="wide")
 
@@ -81,25 +88,47 @@ with tempfile.TemporaryDirectory() as tmpdir:
         progress_bar.progress(ratio, text=f"识别 {name}（{done + 1}/{total}）")
 
     try:
-        data = images_to_excel_bytes(
+        results = images_to_grids(
             paths,
             min_confidence=int(min_conf),
-            first_row_header=first_row_header,
             ocr=get_ocr(),
             table_engine=get_table_engine(),
             progress=progress,
         )
+        data = grids_to_excel_bytes(results, first_row_header=first_row_header)
     except Exception as exc:  # 顶层兜底，避免页面直接报错
         st.session_state["result"] = None
         st.error(f"识别出错：{exc}")
     else:
-        st.session_state["result"] = {"data": data, "count": len(uploaded)}
+        st.session_state["result"] = {
+            "data": data,
+            "count": len(uploaded),
+            "results": results,
+        }
         progress_bar.progress(1.0, text="识别完成")
 
 # ---------- 结果与下载 ----------
 result = st.session_state.get("result")
 if result:
     st.success(f"识别完成 ✅ 已处理 {result['count']} 张图片")
+
+    # 预览识别出的表格结构（含合并单元格）
+    with st.expander("🔍 识别结果预览（带合并单元格）", expanded=True):
+        for item in result["results"]:
+            if item.error:
+                st.warning(f"**{item.path.name}**：识别失败（{item.error}）")
+                continue
+            if not item.grids:
+                st.info(f"**{item.path.name}**：未检测到表格")
+                continue
+            for table_index, grid in enumerate(item.grids, start=1):
+                suffix = f"第 {table_index} 个表格" if len(item.grids) > 1 else ""
+                label = f"**{item.path.name}**"
+                if suffix:
+                    label += f"（{suffix}）"
+                st.markdown(f"{label} · {grid.n_rows} 行 × {grid.n_cols} 列")
+                st.markdown(grid.to_html(), unsafe_allow_html=True)
+
     st.download_button(
         "⬇️ 下载汇总 Excel",
         data=result["data"],
