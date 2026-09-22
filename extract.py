@@ -13,10 +13,12 @@ import io
 import logging
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
 import pandas as pd
+from lxml import html as lxml_html
 
 # rapid_table 3.0.2 在导入时会在包目录（site-packages，只读）下创建 models 目录，
 # 在 Streamlit Cloud 等只读环境会抛 PermissionError。这里先把 Path.mkdir 变为容错操作。
@@ -95,9 +97,71 @@ def _filter_ocr(result, min_confidence: int):
     return boxes, txts, kept_scores
 
 
-def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    """删除完全为空的行，保留表格列结构。"""
-    return df.dropna(axis=0, how="all").reset_index(drop=True)
+@dataclass
+class CellRef:
+    """表格中的一个单元格：逻辑坐标与合并跨度，以及识别出的文字。"""
+
+    row: int
+    col: int
+    rowspan: int
+    colspan: int
+    text: str
+
+
+@dataclass
+class TableGrid:
+    """还原后的表格结构：网格尺寸 + 有序的单元格列表（含合并信息）。"""
+
+    n_rows: int
+    n_cols: int
+    cells: list[CellRef]
+
+    def to_frame(self) -> pd.DataFrame:
+        """转成 DataFrame（合并单元格文字放在左上角，其余位置留空）。"""
+        grid = [[""] * self.n_cols for _ in range(self.n_rows)]
+        for cell in self.cells:
+            grid[cell.row][cell.col] = cell.text
+        return pd.DataFrame(grid)
+
+def _parse_table_html(html: str, logic_points) -> TableGrid:
+    """把 rapid_table 输出的 HTML 与逻辑坐标还原成带合并信息的表格结构。
+
+    logic_points 每一行是 [起始行, 结束行, 起始列, 结束列]，与 HTML 里的 <td> 一一对应，
+    因此能精确还原 rowspan / colspan 的合并单元格。
+    """
+    try:
+        tree = lxml_html.fromstring(html)
+        tds = tree.xpath("//td")
+    except Exception:
+        return TableGrid(0, 0, [])
+
+    cells: list[CellRef] = []
+    n_rows = 0
+    n_cols = 0
+    for index, td in enumerate(tds):
+        text = "".join(td.itertext()).strip()
+        try:
+            rowspan = int(td.get("rowspan", 1) or 1)
+            colspan = int(td.get("colspan", 1) or 1)
+        except (TypeError, ValueError):
+            rowspan = colspan = 1
+
+        if logic_points is not None and index < len(logic_points):
+            r0, r1, c0, c1 = (int(v) for v in logic_points[index][:4])
+            rowspan = max(rowspan, r1 - r0 + 1)
+            colspan = max(colspan, c1 - c0 + 1)
+            row, col = r0, c0
+        else:
+            # 兜底：没有逻辑坐标时按顺序平铺（不合并）。
+            row, col = index // max(n_cols, 1), index % max(n_cols, 1)
+            if n_cols == 0:
+                n_cols = len(tds)
+
+        cells.append(CellRef(row, col, rowspan, colspan, text))
+        n_rows = max(n_rows, row + rowspan)
+        n_cols = max(n_cols, col + colspan)
+
+    return TableGrid(n_rows, n_cols, cells)
 
 
 def extract_tables_from_image(
@@ -105,21 +169,22 @@ def extract_tables_from_image(
     ocr: RapidOCR,
     table_engine: RapidTable,
     min_confidence: int = MIN_CONFIDENCE,
-) -> list[pd.DataFrame]:
-    """识别单张图片中的表格，返回 DataFrame 列表。"""
+) -> list[TableGrid]:
+    """识别单张图片中的表格，返回还原后的 TableGrid 列表。"""
     boxes, txts, scores = _filter_ocr(ocr(str(image_path)), min_confidence)
     results = table_engine(str(image_path), ocr_results=[(boxes, txts, scores)])
     html_list = getattr(results, "pred_htmls", None) or []
+    logic_points = getattr(results, "logic_points", None) or []
     if not html_list:
         return []
 
-    frames: list[pd.DataFrame] = []
-    for html in html_list:
-        try:
-            frames.extend(pd.read_html(io.StringIO(html), header=None))
-        except ValueError:  # HTML 中没有表格
-            continue
-    return [_clean_df(df) for df in frames]
+    grids: list[TableGrid] = []
+    for index, html in enumerate(html_list):
+        points = logic_points[index] if index < len(logic_points) else None
+        grid = _parse_table_html(html, points)
+        if grid.n_rows and grid.n_cols:
+            grids.append(grid)
+    return grids
 
 
 def _sanitize_sheet_name(name: str, used: set[str]) -> str:
@@ -134,19 +199,83 @@ def _sanitize_sheet_name(name: str, used: set[str]) -> str:
     return name
 
 
-def _promote_header(df: pd.DataFrame) -> pd.DataFrame:
-    """把第一行提升为列名；空值列名用「列N」兜底。"""
-    if df.empty:
-        return df
-    columns = []
-    for index, value in enumerate(df.iloc[0], start=1):
-        if value is None or (isinstance(value, float) and pd.isna(value)) or str(value).strip() == "":
-            columns.append(f"列{index}")
+def _display_width(text: str) -> int:
+    """粗略估算单元格文字显示宽度：中文字符按 2 个宽度计。"""
+    return sum(2 if ord(char) > 127 else 1 for char in text)
+
+
+def _write_grid_to_sheet(
+    workbook,
+    worksheet,
+    grid: TableGrid,
+    first_row_header: bool = False,
+) -> None:
+    """把 TableGrid 写入工作表，保留合并单元格、边框、列宽，可选首行表头样式。"""
+    header_fmt = workbook.add_format(
+        {
+            "bold": True,
+            "font_color": "#FFFFFF",
+            "bg_color": "#4472C4",
+            "border": 1,
+            "align": "center",
+            "valign": "vcenter",
+            "text_wrap": True,
+        }
+    )
+    cell_fmt = workbook.add_format(
+        {"border": 1, "valign": "top", "text_wrap": True}
+    )
+
+    # 依据单元格内容估算列宽（合并单元格的文字分摊到各列）。
+    widths = [2.0] * grid.n_cols
+    for cell in grid.cells:
+        if not cell.text:
+            continue
+        span = max(cell.colspan, 1)
+        per_col = _display_width(cell.text) / span
+        for c in range(cell.col, min(cell.col + span, grid.n_cols)):
+            widths[c] = max(widths[c], per_col)
+    for c in range(grid.n_cols):
+        worksheet.set_column(c, c, max(4.0, min(widths[c] + 2, 60.0)))
+
+    covered: set[tuple[int, int]] = set()
+    for cell in grid.cells:
+        fmt = header_fmt if (first_row_header and cell.row == 0) else cell_fmt
+        r1 = cell.row + cell.rowspan - 1
+        c1 = cell.col + cell.colspan - 1
+        if cell.rowspan > 1 or cell.colspan > 1:
+            region = [
+                (r, c)
+                for r in range(cell.row, r1 + 1)
+                for c in range(cell.col, c1 + 1)
+            ]
+            if any(rc in covered for rc in region):
+                # 模型偶发输出重叠的合并区域时，退化为普通单元格，避免写入失败。
+                if (cell.row, cell.col) not in covered:
+                    worksheet.write(cell.row, cell.col, cell.text or "", fmt)
+                    covered.add((cell.row, cell.col))
+                continue
+            worksheet.merge_range(cell.row, cell.col, r1, c1, cell.text or "", fmt)
+            covered.update(region)
         else:
-            columns.append(str(value).strip())
-    df = df.iloc[1:].reset_index(drop=True)
-    df.columns = columns
-    return df
+            if (cell.row, cell.col) in covered:
+                continue
+            worksheet.write(cell.row, cell.col, cell.text or "", fmt)
+            covered.add((cell.row, cell.col))
+
+    if first_row_header and grid.n_rows:
+        worksheet.freeze_panes(1, 0)
+
+
+def table_to_excel_bytes(grid: TableGrid, first_row_header: bool = False) -> bytes:
+    """把单个表格写到 Excel 文件（bytes），保留合并单元格、边框与列宽。"""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        workbook = writer.book
+        worksheet = workbook.add_worksheet("表1")
+        _write_grid_to_sheet(workbook, worksheet, grid, first_row_header)
+    buffer.seek(0)
+    return buffer.read()
 
 
 def images_to_excel_bytes(
@@ -164,39 +293,39 @@ def images_to_excel_bytes(
     ocr = ocr or build_ocr()
     table_engine = table_engine or build_table_engine()
     buffer = io.BytesIO()
-    used_names: set[str] = set()
+    used_names: set[str] = {"汇总"}
     manifest: list[dict] = []
 
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        workbook = writer.book
         for index, path in enumerate(image_paths):
             path = Path(path)
             if progress:
                 progress(index, len(image_paths), path.name)
 
             try:
-                frames = extract_tables_from_image(
+                grids = extract_tables_from_image(
                     path, ocr=ocr, table_engine=table_engine, min_confidence=min_confidence
                 )
             except Exception as exc:  # 单张失败不影响其它图片
                 manifest.append({"文件": path.name, "状态": f"识别失败：{exc}"})
                 continue
 
-            if not frames:
+            if not grids:
                 manifest.append({"文件": path.name, "状态": "未检测到表格"})
                 continue
 
-            for table_index, df in enumerate(frames, start=1):
-                if first_row_header:
-                    df = _promote_header(df)
+            for table_index, grid in enumerate(grids, start=1):
                 sheet = _sanitize_sheet_name(f"{path.stem}_{table_index}", used_names)
-                df.to_excel(writer, sheet_name=sheet, index=False)
+                worksheet = workbook.add_worksheet(sheet)
+                _write_grid_to_sheet(workbook, worksheet, grid, first_row_header)
                 manifest.append(
                     {
                         "文件": path.name,
                         "工作表": sheet,
                         "状态": "成功",
-                        "行数": len(df),
-                        "列数": len(df.columns),
+                        "行数": grid.n_rows,
+                        "列数": grid.n_cols,
                     }
                 )
 

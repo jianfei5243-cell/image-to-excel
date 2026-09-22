@@ -32,6 +32,7 @@ with st.expander("💡 使用说明", expanded=False):
     st.markdown(
         "- 支持 **PNG / JPG / BMP / TIFF / WEBP**，一次可上传多张。\n"
         "- 每张图片识别出的表格会写成单独的工作表，另附一个「汇总」工作表。\n"
+        "- 自动还原表格的合并单元格、边框与列宽，尽量贴近原图排版。\n"
         "- 建议图片清晰、表格边框完整，识别率更高。\n"
         "- 图片仅在本次会话中临时处理，处理完成后即删除，不会保存到服务器。"
     )
@@ -58,7 +59,7 @@ with st.expander("🖼 查看已上传的图片（最多显示 6 张）", expand
 
 # ---------- 识别选项 ----------
 col1, col2, col3 = st.columns(3)
-first_row_header = col1.checkbox("首行作为表头", value=False, help="适合单行表头的简单表格；多行表头建议不勾选。")
+first_row_header = col1.checkbox("首行作为表头", value=False, help="勾选后把第一行加粗并冻结，便于查看；不会删除数据。")
 min_conf = col2.slider("OCR 最低置信度", 0, 99, MIN_CONFIDENCE, help="低于该置信度的文字会被忽略。")
 start = col3.button("🚀 开始识别并生成 Excel", type="primary", use_container_width=True)
 
