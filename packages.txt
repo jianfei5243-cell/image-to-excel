@@ -1,3 +1,6 @@
-# Streamlit Cloud 的 Debian 系统依赖（opencv-python 需要）
 libgl1
 libglib2.0-0
+libsm6
+libxext6
+libxrender1
+libgomp1
