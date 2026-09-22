@@ -12,6 +12,8 @@
 
 ## 在线使用（网页版）
 
+[![Deploy to Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://streamlit.io/cloud)
+
 本仓库可直接部署到 [Streamlit Community Cloud](https://streamlit.io/cloud)（免费，公网可访问）。
 
 ### 一键部署
@@ -23,7 +25,14 @@
 
 > 首次访问会加载识别引擎（可能需联网下载约 7MB 的表格模型），之后会自动缓存、速度更快。
 
-### 本地运行网页版
+### 本地运行网页版（双击启动，无需终端）
+
+**双击 `启动网页版.command`**，浏览器会自动打开 `http://localhost:8501`。
+关闭服务：双击 `停止网页版.command`。
+
+> 首次双击若提示无法打开，右键该文件 →「打开」。
+
+也可以手动用命令行运行：
 
 ```bash
 python3 -m venv .venv
